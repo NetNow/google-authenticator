@@ -155,6 +155,23 @@ static const char *get_user_name(pam_handle_t *pamh, const Params *params) {
   return username;
 }
 
+static char *get_secret_filenameLocal(pam_handle_t *pamh, const Params *params,
+                                 const char *username, int *uid) {
+  // Check whether the administrator decided to override the default location
+  // for the secret file.
+  const char *spec = params->secret_filename_spec
+    ? params->secret_filename_spec : SECRET;
+
+  log_message(LOG_ERR, pamh, "user=%s", username);
+  log_message(LOG_ERR, pamh, "spec=%s", params->secret_filename_spec);
+  char *secret_filename = (char *)malloc(strlen(spec)+strlen(username)+1);
+  sprintf(secret_filename,"%s%s",spec,username);
+  log_message(LOG_ERR, pamh, "secret_filename=%s", secret_filename);
+ 
+  return secret_filename;
+}
+
+
 static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
                                  const char *username, int *uid) {
   // Check whether the administrator decided to override the default location
@@ -349,7 +366,7 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
 
 static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
                             struct Params *params, const char *username,
-                            int uid, struct stat *orig_stat) {
+                            int uid, struct stat *orig_stat, int checkPermissions) {
   // Try to open "~/.google_authenticator"
   int fd = open(secret_filename, O_RDONLY);
   if (fd < 0 ||
@@ -376,30 +393,32 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
                 orig_stat->st_mode & 03777, params->allowed_perm);
   }
 
-  // Check permissions on "~/.google_authenticator".
-  if (!S_ISREG(orig_stat->st_mode)) {
-    log_message(LOG_ERR, pamh, "Secret file \"%s\" is not a regular file",
-                secret_filename);
-    goto error;
-  }
-  if (orig_stat->st_mode & 03777 & ~params->allowed_perm) {
-    log_message(LOG_ERR, pamh,
-                "Secret file \"%s\" permissions (%04o)"
-                " are more permissive than %04o", secret_filename,
-                orig_stat->st_mode & 03777, params->allowed_perm);
-    goto error;
-  }
+  if (checkPermissions) {
+      // Check permissions on "~/.google_authenticator".
+      if (!S_ISREG(orig_stat->st_mode)) {
+	log_message(LOG_ERR, pamh, "Secret file \"%s\" is not a regular file",
+		    secret_filename);
+	goto error;
+      }
+      if (orig_stat->st_mode & 03777 & ~params->allowed_perm) {
+	log_message(LOG_ERR, pamh,
+		    "Secret file \"%s\" permissions (%04o)"
+		    " are more permissive than %04o", secret_filename,
+		    orig_stat->st_mode & 03777, params->allowed_perm);
+	goto error;
+      }
 
-  if (!params->no_strict_owner && (orig_stat->st_uid != (uid_t)uid)) {
-    char buf[80];
-    if (params->fixed_uid) {
-      snprintf(buf, sizeof buf, "user id %d", params->uid);
-      username = buf;
-    }
-    log_message(LOG_ERR, pamh,
-                "Secret file \"%s\" must be owned by %s",
-                secret_filename, username);
-    goto error;
+      if (!params->no_strict_owner && (orig_stat->st_uid != (uid_t)uid)) {
+	char buf[80];
+	if (params->fixed_uid) {
+	  snprintf(buf, sizeof buf, "user id %d", params->uid);
+	  username = buf;
+	}
+	log_message(LOG_ERR, pamh,
+		    "Secret file \"%s\" must be owned by %s",
+		    secret_filename, username);
+	goto error;
+      }
   }
 
   // Sanity check for file length
@@ -1490,10 +1509,10 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   // Read and process status file, then ask the user for the verification code.
   int early_updated = 0, updated = 0;
   if ((username = get_user_name(pamh, &params)) &&
-      (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
-      !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
+      (secret_filename = get_secret_filenameLocal(pamh, &params, username, &uid)) &&
+      //!drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
       (fd = open_secret_file(pamh, secret_filename, &params, username, uid,
-                             &orig_stat)) >= 0 &&
+                             &orig_stat, 0)) >= 0 &&
       (buf = read_file_contents(pamh, &params, secret_filename, &fd,
                                 orig_stat.st_size)) &&
       (secret = get_shared_secret(pamh, &params, secret_filename, buf, &secretLen)) &&
@@ -1591,6 +1610,8 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
         }
       }
 
+      log_message(LOG_ERR, pamh, "pw='%s'",pw);
+      
       // Check all possible types of verification codes.
       switch (check_scratch_codes(pamh, &params, secret_filename, &updated, buf, code)){
       case 1:
@@ -1634,7 +1655,8 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     // the system password. We already removed the verification
     // code from the end of the password.
     if (rc == PAM_SUCCESS && params.forward_pass) {
-      if (!pw || pam_set_item(pamh, PAM_AUTHTOK, pw) != PAM_SUCCESS) {
+       log_message(LOG_ERR, pamh, "setting pass='%s'",pw);
+       if (!pw || pam_set_item(pamh, PAM_AUTHTOK, pw) != PAM_SUCCESS) {
         rc = PAM_AUTH_ERR;
       }
     }
@@ -1705,6 +1727,9 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     memset(secret, 0, secretLen);
     free(secret);
   }
+  log_message(LOG_ERR, pamh, "SUCCESS/AUTH_ERR is=%i",PAM_SUCCESS, PAM_AUTH_ERR);
+  
+  log_message(LOG_ERR, pamh, "rc=%i",rc);
   return rc;
 }
 
